@@ -1,9 +1,15 @@
 package doctotext
 
+//https://docs.microsoft.com/en-us/openspecs/office_file_formats/ms-doc/01d5d8c4-cf9c-4ef9-80fd-439e763cfe01
+
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"golang.org/x/text/encoding/charmap"
+	"golang.org/x/text/transform"
+	"io/ioutil"
 	"os"
 	"unicode/utf16"
 	"unicode/utf8"
@@ -19,9 +25,14 @@ func ReadBytesAt(source []byte, offset int64, size int64) ([]byte, error) {
 	return result, err
 }
 
-func ToInt32(source []byte, offset int64) (uint32, error) {
+func ToUInt32(source []byte, offset int64) (uint32, error) {
 	data, err := ReadBytesAt(source, offset, 4)
 	return binary.LittleEndian.Uint32(data), err
+}
+
+func ToUInt16(source []byte, offset int64) (uint16, error) {
+	data, err := ReadBytesAt(source, offset, 2)
+	return binary.LittleEndian.Uint16(data), err
 }
 
 // UTF16BytesToString converts UTF-16 encoded bytes, in big or little endian byte order,
@@ -65,11 +76,22 @@ func DocToText(file *os.File) (string, error) {
 		return "", err
 	}
 
-	fcOffset := 0x01A2
-	lcbOffset := 0x01A6
+	wIdent, err := ToUInt16(fib, 0)
+	if wIdent != 0xA5EC {
+		return "", errors.New("it is not a word document")
+	}
 
-	fcClx, err := ToInt32(fib, int64(fcOffset))
-	lcbClx, err := ToInt32(fib, int64(lcbOffset))
+	//offset of FibRgFcLcb97 in fib is 154 bytes
+	//offset in FibRgFcLcb97 is 66*4 = 264 bytes
+	//so we can use fcOffset = 418 and lcbOffset 422
+	//it works for all formats
+	//fcOffset := 0x01A2
+	//lcbOffset := 0x01A6
+	fcOffset := 418
+	lcbOffset := 422
+
+	fcClx, err := ToUInt32(fib, int64(fcOffset))
+	lcbClx, err := ToUInt32(fib, int64(lcbOffset))
 	if err != nil {
 		return "", err
 	}
@@ -79,9 +101,12 @@ func DocToText(file *os.File) (string, error) {
 	if tableEntry == nil {
 		return "", err
 	}
-	_, err = tableEntry.ReadAt(clx, int64(fcClx))
+	l, err := tableEntry.ReadAt(clx, int64(fcClx))
 	if err != nil {
 		return "", err
+	}
+	if l != int(lcbClx) {
+		return "", errors.New("copied array should have specific length")
 	}
 
 	/*The clx byte array can contain multiple substructures and only one of these substructures is the piece
@@ -90,30 +115,33 @@ func DocToText(file *os.File) (string, error) {
 		If the substructure describes a piece table the value of this byte is 2, otherwise 1. The length of the
 	entry is a 32 bit value for a piece table and an 8 bit value for all other entries.*/
 
-	var pieceTable []byte
+	var pieceTable_PlcPcd []byte
 	var lcbPieceTable uint32
 	pos := 0
 	goOn := true
 
 	for goOn {
-		typeEntry := clx[pos]
+		clxt := clx[pos]
 
-		if typeEntry == 2 {
+		if clxt == 2 {
 			goOn = false
-			lcbPieceTable, err = ToInt32(clx, int64(pos+1))
+			lcbPieceTable, err = ToUInt32(clx, int64(pos+1))
 			if err != nil {
 				return "", err
 			}
-			pieceTable = make([]byte, lcbPieceTable)
-			copy(pieceTable, clx[pos+5:pos+int(lcbPieceTable)])
-		} else if typeEntry == 1 {
+			pieceTable_PlcPcd = make([]byte, lcbPieceTable)
+			l := copy(pieceTable_PlcPcd, clx[pos+5:pos+5+int(lcbPieceTable)])
+			if l != int(lcbPieceTable) {
+				return "", errors.New("copied array should have specific length")
+			}
+		} else if clxt == 1 {
 			//skip this entry
 			pos = pos + 1 + 1 + int(clx[pos+1])
 		} else {
 			goOn = false
 		}
 	}
-	fmt.Println(pieceTable)
+	fmt.Println(pieceTable_PlcPcd)
 
 	/*The piece table itself contains two arrays:
 	The first array contains n+1 logical character positions (n is the number of pieces). The
@@ -135,8 +163,8 @@ func DocToText(file *os.File) (string, error) {
 
 	for i := 0; i < int(pieceCount); i++ {
 		//get the position
-		cpStart, err = ToInt32(pieceTable, int64(i*4))
-		cpEnd, err = ToInt32(pieceTable, int64((i+1)*4))
+		cpStart, err = ToUInt32(pieceTable_PlcPcd, int64(i*4))
+		cpEnd, err = ToUInt32(pieceTable_PlcPcd, int64((i+1)*4))
 		if err != nil {
 			return "", err
 		}
@@ -144,10 +172,13 @@ func DocToText(file *os.File) (string, error) {
 		//get the descriptor
 		pieceDescriptor = make([]byte, 8)
 		offsetPieceDescriptor := ((pieceCount + 1) * 4) + uint32(i*8)
-		copy(pieceDescriptor, pieceTable[offsetPieceDescriptor:offsetPieceDescriptor+8])
+		l := copy(pieceDescriptor, pieceTable_PlcPcd[offsetPieceDescriptor:offsetPieceDescriptor+8])
+		if l != 8 {
+			return "", errors.New("copied array should have specific length")
+		}
 
 		//The interpretation of the encoding flag and the calculation of the FC pointer are as follows:
-		fcValue, err := ToInt32(pieceDescriptor, 2)
+		fcValue, err := ToUInt32(pieceDescriptor, 2)
 		if err != nil {
 			return "", err
 		}
@@ -166,7 +197,13 @@ func DocToText(file *os.File) (string, error) {
 			return "", err
 		}
 
-		text := UTF16BytesToString(bytesOfText, binary.LittleEndian)
+		text := ""
+		if !isANSI {
+			text = UTF16BytesToString(bytesOfText, binary.LittleEndian)
+		} else {
+			utf8Bytes, _ := ioutil.ReadAll(transform.NewReader(bytes.NewReader(bytesOfText), charmap.Windows1251.NewDecoder()))
+			text = string(utf8Bytes)
+		}
 
 		fmt.Println(text)
 

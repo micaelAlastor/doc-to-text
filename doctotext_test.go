@@ -22,14 +22,14 @@ func TestDocToText(t *testing.T) {
 }
 
 func TestDocToText2(t *testing.T) {
-	path := filepath.Join("testdata", "lefthand.doc")
+	path := filepath.Join("testdata", "smth.doc")
 	file, err := os.Open(path)
 	defer file.Close()
-	text, err := DocToText(file)
+	_, err = DocToText(file)
 	if err != nil {
 		t.Error(err)
 	}
-	fmt.Println(text)
+	//fmt.Println(text)
 }
 
 func TestMscfbDoc(t *testing.T) {
